@@ -48,7 +48,15 @@ private fun calcStatus(v: Float?, lo: Float?, hi: Float?): ParamStatus {
     }
 }
 
-fun Float.fmt() = if (this % 1 == 0f) toInt().toString() else "%.1f".format(this)
+fun Float.fmt(): String {
+    val rounded = (this * 10).toInt() / 10f
+
+    return if (this % 1f == 0f) {
+        toInt().toString()
+    } else {
+        rounded.toString()
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FULL OBD CATALOGUE  (42 parameters)

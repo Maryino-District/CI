@@ -1,6 +1,7 @@
 package com.carinspector.ui.screens
 
 import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
@@ -14,6 +15,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.*
 import com.carinspector.ui.components.*
 import com.carinspector.ui.data.ParamStatus
@@ -39,6 +41,7 @@ data class HistoryUiState(
     val freeLimit: Int = 3,
 )
 
+@Preview
 @Composable
 fun HistoryScreen(
     state: HistoryUiState = mockHistoryState,

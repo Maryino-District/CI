@@ -17,6 +17,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.*
 import com.carinspector.ui.components.*
 import com.carinspector.ui.data.*
@@ -37,6 +38,7 @@ data class MetricsUiState(
 // SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
 
+@Preview
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MetricsScreen(

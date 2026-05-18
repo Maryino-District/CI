@@ -12,7 +12,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.*
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.*
 import com.carinspector.ui.components.*
 import com.carinspector.ui.theme.Clr
@@ -41,6 +44,7 @@ data class ConnectUiState(
 // SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
 
+@Preview
 @Composable
 fun ConnectScreen(
     state: ConnectUiState = ConnectUiState(),
