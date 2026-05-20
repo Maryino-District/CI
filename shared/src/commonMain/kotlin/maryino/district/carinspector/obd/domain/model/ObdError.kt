@@ -1,5 +1,7 @@
 package maryino.district.carinspector.obd.domain.model
 
+import maryino.district.carinspector.obd.domain.model.transport.ObdTransportType
+
 sealed interface ObdError {
     data class UnsupportedTransport(val type: ObdTransportType) : ObdError
     data class PermissionDenied(val action: ObdRequiredSetupAction) : ObdError
