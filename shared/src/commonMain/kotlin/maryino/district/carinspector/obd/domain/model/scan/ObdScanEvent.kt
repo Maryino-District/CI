@@ -1,6 +1,7 @@
 package maryino.district.carinspector.obd.domain.model.scan
 
 import maryino.district.carinspector.obd.domain.model.ObdError
+import maryino.district.carinspector.obd.domain.model.adapter.DiscoveredObdAdapter
 import maryino.district.carinspector.obd.domain.model.transport.ObdTransportType
 
 /**
