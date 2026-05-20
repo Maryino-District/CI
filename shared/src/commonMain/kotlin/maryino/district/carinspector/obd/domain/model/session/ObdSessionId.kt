@@ -1,5 +1,7 @@
 package maryino.district.carinspector.obd.domain.model.session
 
+import kotlin.jvm.JvmInline
+
 /**
  * Stable id for one successful OBD session.
  *
