@@ -256,7 +256,7 @@ enum class ObdTransportType {
 data class ObdTransportAvailability(
     val type: ObdTransportType,
     val status: ObdTransportStatus,
-    val userAction: ObdUserAction?
+    val userAction: ObdRequiredSetupAction?
 )
 ```
 
@@ -277,15 +277,15 @@ sealed interface ObdTransportStatus {
 - BLE без permission -> `PermissionRequired`.
 - Wi-Fi без подключения к сети адаптера -> `RequiresExternalSetup`.
 
-### `ObdUserAction`
+### `ObdRequiredSetupAction`
 
 ```kotlin
-sealed interface ObdUserAction {
-    data object OpenAndroidBluetoothSettings : ObdUserAction
-    data object GrantBluetoothPermission : ObdUserAction
-    data object EnableBluetooth : ObdUserAction
-    data object ConnectToAdapterWifi : ObdUserAction
-    data object GrantLocalNetworkPermission : ObdUserAction
+sealed interface ObdRequiredSetupAction {
+    data object OpenAndroidBluetoothSettings : ObdRequiredSetupAction
+    data object GrantBluetoothPermission : ObdRequiredSetupAction
+    data object EnableBluetooth : ObdRequiredSetupAction
+    data object ConnectToAdapterWifi : ObdRequiredSetupAction
+    data object GrantLocalNetworkPermission : ObdRequiredSetupAction
 }
 ```
 
@@ -537,7 +537,7 @@ sealed interface ObdConnectionState {
     data class InitializingElm327(val adapter: DiscoveredObdAdapter?) : ObdConnectionState
     data class Connected(val session: ObdSession) : ObdConnectionState
     data class Disconnecting(val sessionId: ObdSessionId) : ObdConnectionState
-    data class Failed(val error: ObdError, val recoverAction: ObdUserAction?) : ObdConnectionState
+    data class Failed(val error: ObdError, val recoverAction: ObdRequiredSetupAction?) : ObdConnectionState
 }
 ```
 
@@ -597,9 +597,9 @@ data class Elm327Info(
 ```kotlin
 sealed interface ObdError {
     data class UnsupportedTransport(val type: ObdTransportType) : ObdError
-    data class PermissionDenied(val action: ObdUserAction) : ObdError
-    data class BluetoothDisabled(val action: ObdUserAction) : ObdError
-    data class NoBondedClassicDevices(val action: ObdUserAction) : ObdError
+    data class PermissionDenied(val action: ObdRequiredSetupAction) : ObdError
+    data class BluetoothDisabled(val action: ObdRequiredSetupAction) : ObdError
+    data class NoBondedClassicDevices(val action: ObdRequiredSetupAction) : ObdError
     data class BlePeripheralUnavailable(val peripheralId: String) : ObdError
     data class BleProfileNotFound(val serviceUuids: List<String>) : ObdError
     data class CandidateIsNotElm327(val targetLabel: String?) : ObdError
@@ -637,7 +637,7 @@ enum class ObdOperation {
 }
 ```
 
-Ошибки должны быть достаточно конкретными, чтобы UI мог предложить следующий шаг, а логи позволяли понять, на каком transport-е, target-е и operation всё сломалось. `ObdUserAction` можно держать прямо в некоторых ошибках для простых recoverable cases, но `ObdConnectionState.Failed.recoverAction` остаётся нормализованным полем для UI. Repository/ErrorMapper заполняет его из ошибки, чтобы presentation не разбирала весь sealed class вручную.
+Ошибки должны быть достаточно конкретными, чтобы UI мог предложить следующий шаг, а логи позволяли понять, на каком transport-е, target-е и operation всё сломалось. `ObdRequiredSetupAction` можно держать прямо в некоторых ошибках для простых recoverable cases, но `ObdConnectionState.Failed.recoverAction` остаётся нормализованным полем для UI. Repository/ErrorMapper заполняет его из ошибки, чтобы presentation не разбирала весь sealed class вручную.
 
 ---
 
