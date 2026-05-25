@@ -651,7 +651,7 @@ enum class ObdOperation {
 
 - агрегировать discovery из Classic/BLE/Wi-Fi;
 - хранить текущую connection state machine;
-- запускать connection attempts по policy через отдельный attempt runner;
+- запускать connection attempts по policy через отдельный attempt runner; /
 - закрывать предыдущий transport перед новым connect;
 - выполнять ELM327 handshake через `Elm327ProtocolSession`;
 - сохранять successful adapter fingerprint для следующего auto-connect.

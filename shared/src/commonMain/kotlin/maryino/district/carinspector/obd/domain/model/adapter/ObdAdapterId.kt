@@ -1,5 +1,7 @@
 package maryino.district.carinspector.obd.domain.model.adapter
 
+import kotlin.jvm.JvmInline
+
 /**
  * Stable domain identifier for a discovered or remembered OBD adapter.
  *
