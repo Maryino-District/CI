@@ -33,6 +33,7 @@ class ObdCandidateRanker {
     private fun DiscoveredObdAdapter.priority(remembered: AdapterFingerprint?): Int =
         when {
             matchesRemembered(remembered) -> PRIORITY_REMEMBERED
+            probeState is ObdCandidateProbeState.ProbeConfirmed -> PRIORITY_PROBE_CONFIRMED
             isKnownBleProfile() -> PRIORITY_KNOWN_BLE_PROFILE
             isClassicObdLikeName() -> PRIORITY_CLASSIC_OBD_LIKE_NAME
             isWifiRememberedSource() -> PRIORITY_WIFI_REMEMBERED_SOURCE
@@ -91,6 +92,7 @@ class ObdCandidateRanker {
 
     private companion object {
         const val PRIORITY_REMEMBERED = 700
+        const val PRIORITY_PROBE_CONFIRMED = 650
         const val PRIORITY_KNOWN_BLE_PROFILE = 600
         const val PRIORITY_CLASSIC_OBD_LIKE_NAME = 500
         const val PRIORITY_WIFI_REMEMBERED_SOURCE = 450
@@ -105,7 +107,6 @@ class ObdCandidateRanker {
                 ObdAdapterConfidence.Low -> 0
                 ObdAdapterConfidence.Medium -> 1
                 ObdAdapterConfidence.High -> 2
-                ObdAdapterConfidence.Confirmed -> 3
             }
 
         fun String.normalizedName(): String =
