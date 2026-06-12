@@ -20,7 +20,7 @@ class WifiTcpCandidateScanner(
     suspend fun scan(remembered: AdapterFingerprint?): List<DiscoveredObdAdapter> {
         val endpoints = LinkedHashMap<EndpointKey, EndpointCandidate>()
 
-        remembered?.toRememberedEndpoint()?.let { endpoints.putIfAbsent(it.key, it) }
+        remembered?.toRememberedEndpoint()?.let { endpoints.putFirst(it) }
 
         val gatewayHost = snapshotProvider.snapshot()?.gatewayHost?.takeIf { it.isNotBlank() }
         gatewayHost?.let { host ->
@@ -31,12 +31,12 @@ class WifiTcpCandidateScanner(
                     source = WifiCandidateSource.Gateway(host),
                     confidence = ObdAdapterConfidence.Medium
                 )
-                endpoints.putIfAbsent(endpoint.key, endpoint)
+                endpoints.putFirst(endpoint)
             }
         }
 
         KnownStaticEndpoints.forEach { endpoint ->
-            endpoints.putIfAbsent(endpoint.key, endpoint)
+            endpoints.putFirst(endpoint)
         }
 
         val now = clock.now()
@@ -73,6 +73,12 @@ class WifiTcpCandidateScanner(
             capabilities = setOf(ObdAdapterCapability.WifiTcpEndpoint),
             lastSeenAt = now
         )
+
+    private fun MutableMap<EndpointKey, EndpointCandidate>.putFirst(endpoint: EndpointCandidate) {
+        if (endpoint.key !in this) {
+            this[endpoint.key] = endpoint
+        }
+    }
 
     private data class EndpointCandidate(
         val host: String,

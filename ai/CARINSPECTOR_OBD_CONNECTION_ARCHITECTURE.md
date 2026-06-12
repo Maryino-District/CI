@@ -651,9 +651,9 @@ enum class ObdOperation {
 
 - агрегировать discovery из Classic/BLE/Wi-Fi;
 - хранить текущую connection state machine;
-- запускать connection attempts по policy через отдельный attempt runner; /
+- запускать connection attempts по policy через отдельный attempt runner;
 - закрывать предыдущий transport перед новым connect;
-- выполнять ELM327 handshake через `Elm327ProtocolSession`;
+- делегировать открытие transport-а и ELM327 handshake в `ObdConnectionAttemptRunner`;
 - сохранять successful adapter fingerprint для следующего auto-connect.
 
 Не должен:
@@ -667,7 +667,7 @@ enum class ObdOperation {
 ```text
 ObdScanCoordinator          агрегирует scanners, собирает ObdDiscoveryEvent и строит ObdScanEvent stream
 ObdCandidateRanker         сортирует candidates и remembered adapter matches
-ObdConnectionAttemptRunner открывает transport, запускает ELM327 init, закрывает failed channel
+ObdConnectionAttemptRunner открывает transport, запускает ELM327 init, возвращает session + protocol session
 ObdCandidateValidator       опционально делает bounded ELM327 probe без создания долгой session
 ObdSessionManager          хранит активную session и lifecycle её coroutine scope
 AdapterMemory              сохраняет/читает successful adapter fingerprint
@@ -675,6 +675,15 @@ ObdErrorMapper             переводит platform/transport/protocol failur
 ```
 
 `DefaultObdConnectionRepository` остаётся фасадом и state machine owner: он принимает команды use case-ов, меняет `connectionState` и делегирует детали этим компонентам.
+
+`ObdConnectionAttemptRunner` — внутренний data-layer компонент. Он может возвращать `Elm327ProtocolSession` вместе с доменной `ObdSession`, но `Elm327ProtocolSession` не выходит в domain API. Repository после успешной попытки передаёт оба объекта в `ObdSessionManager`, а наружу из `connect()` / `autoConnect()` возвращает только `ObdSession`.
+
+```kotlin
+data class ObdConnectionAttemptResult(
+    val session: ObdSession,
+    val protocolSession: Elm327ProtocolSession
+)
+```
 
 ### `ObdAdapterDiscovery`
 
@@ -1213,15 +1222,15 @@ data class WifiNetworkSnapshot(
 - первый endpoint с успешным ELM handshake выигрывает;
 - остальные sockets закрываются.
 
-**Важно: безопасность параллельных попыток.** `ObdConnectionAttemptRunner` возвращает ровно один `ObdResult<ObdSession>` — от первого выигравшего endpoint-а. Реализация должна гарантировать, что `connectionState = Connected` выставляется только один раз, даже если два TCP handshake завершились практически одновременно.
+**Важно: безопасность параллельных попыток.** `ObdConnectionAttemptRunner` возвращает ровно один `ObdResult<ObdConnectionAttemptResult>` — от первого выигравшего endpoint-а. Repository использует `result.session` для domain state/API и передаёт `result.protocolSession` в `ObdSessionManager`. Реализация должна гарантировать, что `connectionState = Connected` выставляется только один раз, даже если два TCP handshake завершились практически одновременно.
 
 Рекомендуемая реализация через `coroutineScope` + `select` или `Channel`:
 
 ```kotlin
 // Внутри ConnectionAttemptRunner — концептуальный пример
-suspend fun attemptWifi(endpoints: List<WifiEndpoint>): ObdResult<ObdSession> =
+suspend fun attemptWifi(endpoints: List<WifiEndpoint>): ObdResult<ObdConnectionAttemptResult> =
     coroutineScope {
-        val winner = Channel<ObdResult<ObdSession>>(capacity = 1)
+        val winner = Channel<ObdResult<ObdConnectionAttemptResult>>(capacity = 1)
         val jobs = endpoints.map { endpoint ->
             launch {
                 val result = tryConnectEndpoint(endpoint)
@@ -1429,7 +1438,13 @@ val obdCommonModule = module {
     single { ObdScanCoordinator(discovery = get()) }
     single { ObdCandidateRanker() }
     single { ObdCandidateValidator(transportFactory = get(), elm327Protocol = get()) }
-    single { ObdConnectionAttemptRunner(transportFactory = get(), elm327Protocol = get()) }
+    single {
+        ObdConnectionAttemptRunner(
+            transportFactory = get(),
+            elm327Protocol = get(),
+            now = { Clock.System.now() }
+        )
+    }
     single { ObdSessionManager() }
     single { AdapterMemory(settings = get()) }
     single { ObdErrorMapper() }
@@ -1543,7 +1558,8 @@ UI selected candidate
  -> ObdTransportFactory.open(target)
  -> ObdByteChannel
  -> Elm327Protocol.openSession(channel) / ELM327 probe
- -> if probe succeeded: ObdSession
+ -> if probe succeeded: ObdConnectionAttemptResult(session, protocolSession)
+ -> repository activates ObdSessionManager with both objects
  -> if probe failed: candidate rejected, channel closed
  -> connectionState = Connected or Failed
 ```
@@ -1702,9 +1718,33 @@ Failed with retry/user action
 
 - открытие transport через `ObdTransportFactory`;
 - ELM327 handshake через `Elm327Protocol.openSession`;
+- возврат `ObdConnectionAttemptResult(session, protocolSession)` после успешного handshake;
+- передачу ownership успешной `Elm327ProtocolSession` caller-у без закрытия;
 - parallel Wi-Fi endpoint attempts с закрытием проигравших sockets;
 - BLE profile probing/fallback для выбранного или remembered candidate;
-- закрытие failed channel до возврата ошибки.
+- закрытие открытого `ObdByteChannel` при failed handshake до возврата ошибки;
+- закрытие открытого `ObdByteChannel` при cancellation после открытия transport-а.
+
+Базовый path runner-а:
+
+```text
+ObdTransportFactory.open(target)
+ -> ObdByteChannel
+ -> Elm327Protocol.openSession(channel)
+ -> ObdConnectionAttemptResult(ObdSession, Elm327ProtocolSession)
+```
+
+Если `open(target)` вернул failure, runner возвращает эту ошибку и не вызывает protocol. Если `openSession(channel)` вернул failure, runner закрывает channel и возвращает исходную typed error. `CancellationException` не маппится в `ObdResult.Failure`: cancellation пробрасывается выше, но уже открытый channel должен быть закрыт в `finally`.
+
+`ConnectedObdAdapter` строится из `ObdConnectionTarget` без platform handles:
+
+```text
+BluetoothClassic: id = deviceAddress, displayName = deviceName ?: deviceAddress, type = BluetoothClassic
+BluetoothLowEnergy: id = peripheralId, displayName = deviceName ?: peripheralId, type = BluetoothLowEnergy
+WifiTcp: id = "host:port", displayName = "host:port", type = WifiTcp
+```
+
+На MVP `ObdSessionId` может быть детерминированным, например `session:${adapterId.value}`. Если позже потребуется различать несколько последовательных подключений к одному adapter, это меняется на отдельный session id factory без изменения публичного repository API.
 
 ### SessionManager отвечает за
 
