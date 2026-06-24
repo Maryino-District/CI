@@ -22,6 +22,8 @@ data class DiscoveredObdAdapter(
     val signal: ObdSignalStrength?,
     /** Confidence score explaining how likely this candidate is to be an OBD adapter. */
     val confidence: ObdAdapterConfidence,
+    /** True when this candidate matches the last successfully connected adapter. */
+    val isRemembered: Boolean = false,
     /** Current validation phase for this candidate. */
     val probeState: ObdCandidateProbeState,
     /** Capabilities inferred during discovery or validation. */

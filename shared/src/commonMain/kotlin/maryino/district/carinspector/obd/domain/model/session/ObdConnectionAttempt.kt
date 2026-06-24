@@ -13,7 +13,7 @@ data class ObdConnectionAttempt(
     val target: ObdConnectionTarget,
     /** Current high-level connection step. */
     val step: ObdConnectionStep,
-    /** One-based attempt counter within the current connect or auto-connect flow. */
+    /** One-based attempt counter within the current connect flow. */
     val attemptNumber: Int,
     /** Moment when this attempt started. */
     val startedAt: Instant

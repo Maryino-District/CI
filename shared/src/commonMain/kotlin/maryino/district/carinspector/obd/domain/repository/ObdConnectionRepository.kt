@@ -1,7 +1,6 @@
 package maryino.district.carinspector.obd.domain.repository
 
 import kotlinx.coroutines.flow.Flow
-import maryino.district.carinspector.obd.domain.model.ObdAutoConnectPolicy
 import maryino.district.carinspector.obd.domain.model.ObdResult
 import maryino.district.carinspector.obd.domain.model.adapter.ObdConnectionTarget
 import maryino.district.carinspector.obd.domain.model.scan.ObdScanEvent
@@ -33,9 +32,6 @@ interface ObdConnectionRepository {
 
     /** Opens the selected target and returns success only after ELM327 handshake. */
     suspend fun connect(target: ObdConnectionTarget): ObdResult<ObdSession>
-
-    /** Runs scan/ranking and may connect silently only to a remembered adapter. */
-    suspend fun autoConnect(policy: ObdAutoConnectPolicy): ObdResult<ObdSession>
 
     /** Cancels scan/attempt/session work and closes active transport resources. */
     suspend fun disconnect()

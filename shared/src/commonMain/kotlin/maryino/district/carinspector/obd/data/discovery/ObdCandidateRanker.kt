@@ -12,7 +12,9 @@ import maryino.district.carinspector.obd.domain.model.transport.ObdTransportType
 /**
  * Orders scan candidates by connection usefulness without mutating discovery state.
  */
-class ObdCandidateRanker {
+class ObdCandidateRanker(
+    private val nameMatcher: ObdLikeNameMatcher = ObdLikeNameMatcher.Default
+) {
     fun rank(
         candidates: List<DiscoveredObdAdapter>,
         remembered: AdapterFingerprint?
@@ -30,9 +32,15 @@ class ObdCandidateRanker {
             .sortedWith(RANKING_COMPARATOR)
             .map { it.candidate }
 
+    fun matchesRemembered(
+        candidate: DiscoveredObdAdapter,
+        remembered: AdapterFingerprint
+    ): Boolean =
+        candidate.matchesRememberedFingerprint(remembered)
+
     private fun DiscoveredObdAdapter.priority(remembered: AdapterFingerprint?): Int =
         when {
-            matchesRemembered(remembered) -> PRIORITY_REMEMBERED
+            isRemembered || matchesRememberedFingerprint(remembered) -> PRIORITY_REMEMBERED
             probeState is ObdCandidateProbeState.ProbeConfirmed -> PRIORITY_PROBE_CONFIRMED
             isKnownBleProfile() -> PRIORITY_KNOWN_BLE_PROFILE
             isClassicObdLikeName() -> PRIORITY_CLASSIC_OBD_LIKE_NAME
@@ -43,7 +51,7 @@ class ObdCandidateRanker {
             else -> PRIORITY_OTHER
         }
 
-    private fun DiscoveredObdAdapter.matchesRemembered(remembered: AdapterFingerprint?): Boolean {
+    private fun DiscoveredObdAdapter.matchesRememberedFingerprint(remembered: AdapterFingerprint?): Boolean {
         if (remembered == null || remembered.transportType != transportType) return false
         return target.normalizedStableId() == remembered.stableId.normalizedStableId(transportType)
     }
@@ -54,10 +62,7 @@ class ObdCandidateRanker {
                 !(target as? ObdConnectionTarget.Ble)?.knownProfileId.isNullOrBlank())
 
     private fun DiscoveredObdAdapter.isClassicObdLikeName(): Boolean =
-        transportType == ObdTransportType.BluetoothClassic &&
-            OBD_LIKE_NAME_MARKERS.any { marker ->
-                displayNameForClassicRanking().normalizedName().contains(marker)
-            }
+        transportType == ObdTransportType.BluetoothClassic && nameMatcher.matches(displayNameForClassicRanking())
 
     private fun DiscoveredObdAdapter.isWifiRememberedSource(): Boolean =
         (target as? ObdConnectionTarget.WifiTcp)?.source is WifiCandidateSource.Remembered
@@ -109,26 +114,12 @@ class ObdCandidateRanker {
                 ObdAdapterConfidence.High -> 2
             }
 
-        fun String.normalizedName(): String =
-            lowercase().filterNot { it == ' ' || it == '\t' || it == '\n' || it == '\r' || it == '-' || it == '_' }
-
         fun String.normalizedStableId(transportType: ObdTransportType): String =
             when (transportType) {
                 ObdTransportType.BluetoothClassic -> uppercase()
                 ObdTransportType.BluetoothLowEnergy,
                 ObdTransportType.WifiTcp -> this
             }
-
-        val OBD_LIKE_NAME_MARKERS = listOf(
-            "OBDII",
-            "OBD-II",
-            "ELM327",
-            "V-LINK",
-            "Vgate",
-            "OBDLink",
-            "Viecar",
-            "Car Scanner"
-        ).map { it.normalizedName() }
 
         val RANKING_COMPARATOR = compareBy<RankedCandidate> { it.rejected }
             .thenByDescending { it.priority }

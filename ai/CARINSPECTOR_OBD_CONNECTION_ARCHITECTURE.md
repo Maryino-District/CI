@@ -155,12 +155,63 @@ Platform dependencies:
 ```text
 androidMain:
   Android Bluetooth/BLE APIs через SDK
-  Android permissions/helpers при необходимости
+  Android runtime permission helpers
+  Android manifest permissions в app module
 
 iosMain:
   CoreBluetooth interop
   Network/Wi-Fi snapshot helpers через platform APIs
 ```
+
+### Android manifest permissions
+
+Android manifest contract живёт в `composeApp/src/androidMain/AndroidManifest.xml`, потому что `composeApp` владеет Android application manifest. `shared/androidMain` и platform scanner-ы могут проверять runtime permissions и system state, но не должны скрыто полагаться на отсутствующие manifest entries.
+
+Текущий baseline для OBD transport-ов:
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+<uses-permission
+    android:name="android.permission.BLUETOOTH"
+    android:maxSdkVersion="30" />
+<uses-permission
+    android:name="android.permission.BLUETOOTH_ADMIN"
+    android:maxSdkVersion="30" />
+<uses-permission
+    android:name="android.permission.ACCESS_FINE_LOCATION"
+    android:maxSdkVersion="30" />
+
+<uses-permission
+    android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+<uses-feature
+    android:name="android.hardware.bluetooth"
+    android:required="false" />
+<uses-feature
+    android:name="android.hardware.bluetooth_le"
+    android:required="false" />
+```
+
+Назначение:
+
+- `INTERNET` нужен для TCP socket-а к Wi-Fi OBD endpoint.
+- `ACCESS_NETWORK_STATE` и `ACCESS_WIFI_STATE` нужны для Wi-Fi availability/snapshot logic: network state, Wi-Fi state, gateway/local host/SSID/BSSID там, где Android это разрешает.
+- `BLUETOOTH` и `BLUETOOTH_ADMIN` ограничены `maxSdkVersion="30"` для Android 11 и ниже.
+- `ACCESS_FINE_LOCATION` ограничен `maxSdkVersion="30"`, потому что BLE scan на Android 6-11 завязан на location permission.
+- `BLUETOOTH_SCAN` и `BLUETOOTH_CONNECT` покрывают Android 12+ scan/connect path.
+- `android:usesPermissionFlags="neverForLocation"` фиксирует privacy assertion: BLE scan используется для поиска OBD-кандидатов, а не для location inference. Возможный tradeoff — Android может фильтровать часть BLE beacon-ов, но для OBD discovery это приемлемо.
+- `uses-feature` объявлены как `required="false"`, потому что отсутствие Bluetooth/BLE должно маппиться в `UnsupportedOnPlatform` / `DisabledBySystem`, а не блокировать установку приложения.
+
+Non-goals текущего manifest baseline:
+
+- `BLUETOOTH_ADVERTISE` не добавляется: CarInspector не делает телефон BLE advertiser и не включает discoverable mode.
+- Runtime permission UI не входит в этот слой. Scanner/availability provider должны возвращать `PermissionRequired` / `PermissionDenied`, а presentation позже решит, как запросить permission.
+- Local-network permission для будущих Android SDK не добавляется без отдельной проверки SDK contract и runtime UX. Wi-Fi TCP flow пока опирается на `INTERNET`, network state и явное подключение пользователя к сети OBD-адаптера на уровне OS.
 
 `kotlin.time.Duration` можно использовать из stdlib. Если выбирается не Koin, DI-раздел ниже нужно переписать под фактический контейнер, но сами границы компонентов остаются теми же.
 
@@ -190,8 +241,6 @@ interface ObdConnectionRepository {
     fun scan(request: ObdScanRequest): Flow<ObdScanEvent>
 
     suspend fun connect(target: ObdConnectionTarget): ObdResult<ObdSession>
-
-    suspend fun autoConnect(policy: ObdAutoConnectPolicy): ObdResult<ObdSession>
 
     suspend fun disconnect()
 }
@@ -224,7 +273,6 @@ ObserveObdConnectionStateUseCase
 ObserveObdTransportAvailabilityUseCase
 ScanObdAdaptersUseCase
 ConnectObdAdapterUseCase
-AutoConnectObdAdapterUseCase
 DisconnectObdAdapterUseCase
 ```
 
@@ -305,7 +353,7 @@ data class ObdScanRequest(
 )
 ```
 
-Используется для единой кнопки `Найти адаптер` и auto-connect.
+Используется для единой кнопки `Найти адаптер` и remembered-aware discovery.
 
 По умолчанию scan всегда запускает все доступные транспорты параллельно:
 
@@ -351,6 +399,7 @@ data class DiscoveredObdAdapter(
     val target: ObdConnectionTarget,
     val signal: ObdSignalStrength?,
     val confidence: ObdAdapterConfidence,
+    val isRemembered: Boolean = false,
     val probeState: ObdCandidateProbeState,
     val capabilities: Set<ObdAdapterCapability>,
     val lastSeenAt: Instant
@@ -361,6 +410,7 @@ data class DiscoveredObdAdapter(
 
 - единая карточка кандидата для UI;
 - содержит `target`, достаточный для подключения;
+- сообщает UI, совпадает ли candidate с последним successful adapter fingerprint;
 - не раскрывает наружу platform-specific handle.
 
 ### `ObdCandidateProbeState`
@@ -377,15 +427,14 @@ sealed interface ObdCandidateProbeState {
 
 Это фиксирует фазу кандидата. BLE advertisement candidate, BLE service-discovered candidate, Wi-Fi endpoint candidate и ELM-confirmed candidate имеют разную степень достоверности. UI может показывать один список, но data layer не должен путать "похоже на OBD" и "подтверждено ELM327 probe".
 
-Важно: scanner-ы не делают ELM327 probe сами. `ProbeInProgress`, `ProbeConfirmed` и `Rejected` появляются только после работы `ObdConnectionAttemptRunner` или отдельного bounded `ObdCandidateValidator`, которым владеет repository/state machine. Это сохраняет чистую границу:
+Важно: scanner-ы не делают ELM327 probe сами. В текущей продуктовой модели ELM327-проверка запускается только после явного выбора пользователя через `connect(target)`, а состояние кандидата обновляет repository/state machine. Это сохраняет чистую границу:
 
 ```text
 scanner   -> находит возможный candidate
-validator -> временно открывает transport и проверяет ELM327 probe
-connect   -> создаёт долгоживущую ObdSession после успешного handshake
+connect   -> открывает transport и создаёт долгоживущую ObdSession после успешного handshake
 ```
 
-Если в первой реализации не нужен pre-validation, `ObdCandidateProbeState` может оставаться `AdvertisementOnly` / `ServiceDiscovered` до явного выбора пользователя. Тогда failed connect обновляет candidate в списке до `Rejected`.
+В MVP `ObdCandidateProbeState` обычно остаётся `AdvertisementOnly` / `ServiceDiscovered` до явного выбора пользователя. Failed connect обновляет candidate в списке до `Rejected`; successful connect переводит глобальное состояние в `Connected`.
 
 ### `ObdConnectionTarget`
 
@@ -399,8 +448,8 @@ sealed interface ObdConnectionTarget {
     data class Ble(
         val peripheralId: String,
         val deviceName: String?,
-        val knownProfile: BleObdProfile?,
-        val discoveredServices: List<BleServiceSummary>,
+        val knownProfileId: String?,
+        val discoveredServiceUuids: List<String>,
         val discoveredAt: Instant
     ) : ObdConnectionTarget
 
@@ -434,14 +483,17 @@ sealed interface WifiCandidateSource {
 
 Для BLE `peripheralId` - это stable-ish identifier, а не platform handle. Он недостаточен сам по себе, чтобы открыть соединение в любой момент времени: platform layer должен иметь resolver/cache, который умеет превратить `peripheralId` обратно в актуальный platform peripheral/device.
 
-Концептуально это выглядит как `BlePeripheralResolver`, но это platform/internal контракт ниже `ObdTransportFactory`, а не domain API. Его return type может быть Android `BluetoothDevice`/GATT wrapper или iOS `CBPeripheral` wrapper; common/domain слой видит только результат открытия `ObdByteChannel`.
+`knownProfileId` хранит только id профиля из registry, а не весь `BleObdProfile`, чтобы `ObdConnectionTarget` оставался лёгкой serializable-ish моделью без лишнего дублирования profile metadata. `discoveredServiceUuids` - это scan-time / cached UUID-сигналы, а не полноценный результат GATT service discovery. Реальный GATT discovery возвращает `List<BleServiceSummary>` через BLE connection contract после explicit connect.
+
+Концептуально resolver выглядит как `BlePeripheralResolver`, но это data/platform boundary ниже `ObdTransportFactory`, а не domain API. Его common return type - opaque `BleResolvedPeripheral`; Android `BluetoothDevice`/`BluetoothGatt`, iOS `CBPeripheral` и любые native handles остаются private implementation detail внутри platform BLE client. Common/domain слой видит только stable BLE ids, `BleResolvedPeripheral` metadata и результат открытия `ObdByteChannel`.
 
 Правила:
 
-- resolved peripheral handle остаётся platform/internal типом и не выходит в domain;
-- resolver живёт в platform BLE client и связан с lifecycle `CBCentralManager` / Android BLE scanner;
-- BLE candidate имеет TTL: если target устарел или peripheral больше не в cache, connect должен вернуть typed error и предложить повторить scan. TTL считается с `discoveredAt` из `ObdConnectionTarget.Ble`. Рекомендуемый диапазон: **30–60 секунд** для обычных кандидатов; для remembered adapter можно использовать более мягкий TTL (до 120 секунд), так как перед auto-connect всё равно запускается свежий scan/resolve. На iOS `retrievePeripherals(withIdentifiers:)` работает только пока app в foreground и `CBCentralManager` жив — это естественный потолок TTL на этой платформе;
-- remembered BLE adapter хранит `peripheralId` и successful `bleProfileId`, но перед auto-connect всё равно проходит свежий scan/resolve;
+- native peripheral handle остаётся platform/internal типом и не выходит в common/domain contracts;
+- resolver живёт внутри `BleObdPlatformClient` и связан с lifecycle `CBCentralManager` / Android BLE scanner;
+- `BlePeripheralResolver` не должен создаваться как независимый singleton: его нужно получать из того же `BleObdPlatformClient`, который будет выполнять `connect()`;
+- BLE candidate имеет TTL: если target устарел или peripheral больше не в cache, connect должен вернуть typed error и предложить повторить scan. TTL считается с `discoveredAt` из `ObdConnectionTarget.Ble`. Рекомендуемый диапазон: **30–60 секунд** для обычных кандидатов; для remembered adapter можно использовать более мягкий TTL (до 120 секунд), потому что remembered marking всё равно требует свежий scan/resolve. На iOS `retrievePeripherals(withIdentifiers:)` работает только пока app в foreground и `CBCentralManager` жив — это естественный потолок TTL на этой платформе;
+- remembered BLE adapter хранит `peripheralId` и successful `bleProfileId`, но перед marking всё равно проходит свежий scan/resolve;
 - iOS implementation должна учитывать, что `CBPeripheral` нельзя сериализовать и нельзя восстановить без CoreBluetooth retrieve/scan lifecycle.
 
 ### `BleObdProfile`
@@ -451,10 +503,11 @@ data class BleObdProfile(
     val id: String,
     val displayName: String,
     val serviceUuid: String,
-    val notifyCharacteristicUuid: String,
-    val writeCharacteristicUuid: String,
+    val notifyCharacteristicUuid: String?,
+    val writeCharacteristicUuid: String?,
     val writeMode: BleWriteMode,
-    val requiresMtuNegotiation: Boolean
+    val requiresMtuNegotiation: Boolean,
+    val specificity: Int
 )
 ```
 
@@ -490,25 +543,110 @@ data class BleCharacteristicSummary(
     val uuid: String,
     val properties: Set<BleCharacteristicProperty>
 )
+
+enum class BleCharacteristicProperty {
+    Read,
+    Write,
+    WriteWithoutResponse,
+    Notify,
+    Indicate
+}
+
+enum class BleWriteMode {
+    WithResponse,
+    WithoutResponse,
+    WithoutResponsePreferred,
+    ByCharacteristicProperty
+}
 ```
 
 Нужен для fallback по неизвестным BLE-адаптерам: если UUID не совпал с registry, можно искать UART-like профиль по свойствам characteristic.
 
-### `ObdAutoConnectPolicy`
+### BLE common contracts
+
+BLE common contracts живут в `shared/commonMain` в `obd.data.ble`. Это не domain API для UI, а boundary между common data orchestration и Android/iOS BLE implementation. Главная цель - не допустить протекания `BluetoothDevice`, `BluetoothGatt`, `CBPeripheral` или `Any nativeHandle` выше platform layer.
 
 ```kotlin
-data class ObdAutoConnectPolicy(
-    val scanWindow: Duration,
-    val timeoutPerCandidate: Duration,
-    val maxParallelWifiAttempts: Int,
-    val rememberSuccessfulAdapter: Boolean,
-    val allowUnknownBleHeuristics: Boolean
+interface BleObdPlatformClient {
+    val resolver: BlePeripheralResolver
+
+    fun scan(request: BleScanRequest): Flow<BleScanEvent>
+
+    suspend fun connect(
+        peripheral: BleResolvedPeripheral
+    ): ObdResult<BlePeripheralConnection>
+}
+```
+
+`BleObdPlatformClient` - lifecycle owner для BLE state. Android implementation может держать scanner/GATT cache, iOS implementation - `CBCentralManager` и `CBPeripheral` cache, но common caller не видит эти handles.
+
+```kotlin
+interface BlePeripheralResolver {
+    suspend fun resolve(target: ObdConnectionTarget.Ble): ObdResult<BleResolvedPeripheral>
+}
+
+interface BleResolvedPeripheral {
+    val peripheralId: String
+    val name: String?
+    val resolvedAt: Instant
+}
+```
+
+`BleResolvedPeripheral` - opaque common object. Он валиден только для той пары `BleObdPlatformClient.resolver` / `BleObdPlatformClient.connect()`, которая его создала. Передавать resolved peripheral между независимыми client instances нельзя.
+
+```kotlin
+data class BleScanRequest(
+    val timeout: Duration,
+    val includeRememberedCandidates: Boolean,
+    val includeHeuristicCandidates: Boolean
+)
+
+sealed interface BleScanEvent {
+    data class PeripheralFound(val peripheral: BleScannedPeripheral) : BleScanEvent
+    data class PeripheralUpdated(val peripheral: BleScannedPeripheral) : BleScanEvent
+    data class Failed(val error: ObdError) : BleScanEvent
+    data object Finished : BleScanEvent
+}
+
+data class BleScannedPeripheral(
+    val peripheralId: String,
+    val name: String?,
+    val rssiDbm: Int?,
+    val advertisedServiceUuids: List<String>,
+    val manufacturerData: List<BleManufacturerData>,
+    val isConnectable: Boolean?,
+    val seenAt: Instant
 )
 ```
 
-Auto-connect не спрашивает тип транспорта. Он использует общий scan, который одновременно запускает Classic/BLE/Wi-Fi, ранжирует кандидатов и может автоматически подключаться только к ранее успешно подтверждённому remembered adapter.
+`advertisedServiceUuids` - это данные рекламы/scan result, а не результат GATT discovery. `manufacturerData` хранится как redacted/encoded summary, пригодный для ranking и profile disambiguation без platform-specific advertisement objects.
 
-Если remembered adapter не найден или не прошёл ELM327 probe, ranking используется только для порядка показа и порядка ручных попыток подключения. Silent auto-connect к новому "самому сильному" кандидату запрещён: рядом могут быть чужие BLE/Wi-Fi устройства.
+```kotlin
+interface BlePeripheralConnection {
+    val peripheralId: String
+
+    suspend fun discoverServices(): ObdResult<List<BleServiceSummary>>
+
+    suspend fun openSerialChannel(profile: BleObdProfile): ObdResult<ObdByteChannel>
+
+    suspend fun close()
+}
+```
+
+`BlePeripheralConnection.close()` обязан быть idempotent и закрывать GATT connection, notification subscriptions и pending platform work. Это важно, потому что ошибка может случиться до создания `ObdByteChannel`: при resolve, connect, service discovery, profile selection или subscribe notify. BLE transport/factory закрывает connection в `finally` на failed/cancelled path; ownership успешного `ObdByteChannel` передаётся дальше в ELM327 protocol/session lifecycle.
+
+### Remembered-aware discovery
+
+Приложение не должно открывать transport автоматически только потому, что scanner увидел знакомый адаптер. Remembered adapter используется как сигнал для UI и ranking:
+
+- candidate получает `isRemembered = true`, если совпал с сохранённым `AdapterFingerprint`;
+- `ObdCandidateRanker` поднимает remembered candidate выше остальных;
+- UI может показать бейдж/маркер "ранее подключался";
+- подключение выполняется только после явного выбора пользователя через `connect(target)`.
+
+Если remembered adapter не найден, scan не считается ошибкой. Пользователь просто видит обычный список candidates.
+
+Автоматическое открытие transport к новому "самому сильному" candidate запрещено: рядом могут быть чужие BLE/Wi-Fi устройства. Автоматическое открытие transport к remembered candidate также не используется в текущей продуктовой модели.
 
 Ранжирование кандидатов:
 
@@ -521,7 +659,7 @@ Auto-connect не спрашивает тип транспорта. Он исп�
 6. lower-confidence name match
 ```
 
-Порядок транспортов не должен превращаться в UI-выбор. Это только внутренняя стратегия ranking/attempt. Если candidate уже прошёл bounded validation и получил `ProbeConfirmed`, он поднимается выше неподтверждённых candidates, но такой validation не является обязанностью scanner-а.
+Порядок транспортов не должен превращаться в UI-выбор. Это только внутренняя стратегия ranking/attempt. Scan не открывает transport для проверки кандидатов; ELM327 handshake выполняется в explicit connect flow.
 
 ### `ObdConnectionState`
 
@@ -654,7 +792,7 @@ enum class ObdOperation {
 - запускать connection attempts по policy через отдельный attempt runner;
 - закрывать предыдущий transport перед новым connect;
 - делегировать открытие transport-а и ELM327 handshake в `ObdConnectionAttemptRunner`;
-- сохранять successful adapter fingerprint для следующего auto-connect.
+- сохранять successful adapter fingerprint для следующего remembered-aware scan.
 
 Не должен:
 
@@ -668,7 +806,6 @@ enum class ObdOperation {
 ObdScanCoordinator          агрегирует scanners, собирает ObdDiscoveryEvent и строит ObdScanEvent stream
 ObdCandidateRanker         сортирует candidates и remembered adapter matches
 ObdConnectionAttemptRunner открывает transport, запускает ELM327 init, возвращает session + protocol session
-ObdCandidateValidator       опционально делает bounded ELM327 probe без создания долгой session
 ObdSessionManager          хранит активную session и lifecycle её coroutine scope
 AdapterMemory              сохраняет/читает successful adapter fingerprint
 ObdErrorMapper             переводит platform/transport/protocol failures в ObdError
@@ -676,7 +813,7 @@ ObdErrorMapper             переводит platform/transport/protocol failur
 
 `DefaultObdConnectionRepository` остаётся фасадом и state machine owner: он принимает команды use case-ов, меняет `connectionState` и делегирует детали этим компонентам.
 
-`ObdConnectionAttemptRunner` — внутренний data-layer компонент. Он может возвращать `Elm327ProtocolSession` вместе с доменной `ObdSession`, но `Elm327ProtocolSession` не выходит в domain API. Repository после успешной попытки передаёт оба объекта в `ObdSessionManager`, а наружу из `connect()` / `autoConnect()` возвращает только `ObdSession`.
+`ObdConnectionAttemptRunner` — внутренний data-layer компонент. Он может возвращать `Elm327ProtocolSession` вместе с доменной `ObdSession`, но `Elm327ProtocolSession` не выходит в domain API. Repository после успешной попытки передаёт оба объекта в `ObdSessionManager`, а наружу из `connect()` возвращает только `ObdSession`.
 
 ```kotlin
 data class ObdConnectionAttemptResult(
@@ -684,6 +821,16 @@ data class ObdConnectionAttemptResult(
     val protocolSession: Elm327ProtocolSession
 )
 ```
+
+Текущее состояние skeleton-реализации:
+
+- `DefaultObdConnectionRepository` уже создан в `shared/commonMain`;
+- repository принимает `CoroutineScope`, `ObdAdapterDiscovery`, `ObdCandidateRanker`, `ObdConnectionAttemptRunner`, `ObdSessionManager`, `AdapterMemory` и `now`;
+- `ObdScanCoordinator`, `ObdErrorMapper`, `ObdConnectionLogger` и DI bindings пока не подключены;
+- scan aggregation временно живёт прямо в repository: repository получает `ObdDiscoveryEvent`, собирает candidates, ранжирует их и отдаёт публичные `ObdScanEvent`;
+- `observeSupportedTransports()` в skeleton возвращает все `ObdTransportType` как `Available`; platform availability должна быть отдельной итерацией;
+- `scan()` уже помечает remembered candidates через `DiscoveredObdAdapter.isRemembered` и ранжирует их выше остальных;
+- repository не содержит отдельного API для фонового подключения: текущая продуктовая модель не открывает transport без явного выбора пользователя.
 
 ### `ObdAdapterDiscovery`
 
@@ -706,11 +853,9 @@ sealed interface ObdDiscoveryEvent {
 - `BleObdScanner`;
 - `WifiTcpCandidateScanner`.
 
-Repository/`ObdScanCoordinator` превращает внутренний `ObdDiscoveryEvent` stream в публичный `ObdScanEvent`: добавляет `Started`, общий `Finished`, Android Classic hint и агрегированный список candidates.
+Repository/`ObdScanCoordinator` превращает внутренний `ObdDiscoveryEvent` stream в публичный `ObdScanEvent`: добавляет `Started`, общий `Finished`, Android Classic hint и агрегированный список candidates. В текущем skeleton это делает сам `DefaultObdConnectionRepository`; выделение `ObdScanCoordinator` остаётся следующей декомпозицией.
 
-Scanner-ы не открывают долгоживущие command sessions и не решают, что приложение подключено к OBD. Их максимум - собрать сигналы discovery: bonded device, BLE advertisement/service summary, Wi-Fi endpoint candidate. Если продуктово нужен pre-validation, repository запускает отдельный `ObdCandidateValidator` с малым timeout и лимитами, а результат возвращает в scan stream как `CandidateUpdated(probeState = ProbeConfirmed/Rejected)`.
-
-`ObdCandidateValidator` использует те же `ObdTransportFactory` и `Elm327Protocol`, что и обычный connect, но обязан закрыть channel сразу после probe. Он не сохраняет session в `ObdSessionManager` и не переводит global state в `Connected`.
+Scanner-ы не открывают command sessions и не решают, что приложение подключено к OBD. Их максимум - собрать сигналы discovery: bonded device, BLE advertisement/service summary, Wi-Fi endpoint candidate. Проверка "это действительно ELM327" выполняется только в explicit connect path через `ObdConnectionAttemptRunner` и `Elm327Protocol.openSession()`. Если handshake не прошёл, repository помечает выбранный candidate как `Rejected` и возвращает UI к списку.
 
 ### `ObdTransportFactory`
 
@@ -821,7 +966,6 @@ ATI    adapter identity
 - `connect()` по выбранному candidate отменяет active scan после успешного ELM327 handshake; до успеха scan может продолжать жить, чтобы пользователь не терял новые candidates при неудачной попытке;
 - successful connect завершает текущий scan и закрывает проигравшие Wi-Fi sockets/BLE candidate channels;
 - failed candidate не обязан завершать scan: список остаётся живым, candidate помечается rejected, новые candidates продолжают приходить до timeout;
-- optional candidate validation jobs являются children scan job-а и отменяются вместе со scan;
 - cancellation всегда закрывает `ObdByteChannel`, BLE notifications, GATT connection, RFCOMM socket или TCP socket;
 - `connectionState` обновляется только repository/state machine owner-ом, а не scanner/transport implementation напрямую.
 
@@ -832,13 +976,10 @@ ATI    adapter identity
 ```text
 Idle
   scan()                 -> FindingAdapters
-  autoConnect()          -> FindingAdapters
 
 FindingAdapters
-  candidate found        -> FindingAdapters(candidates += candidate)
-  candidate validated    -> FindingAdapters(candidate.probeState = ProbeConfirmed/Rejected)
+  candidate found        -> FindingAdapters(candidates += candidate, remembered candidate помечен isRemembered)
   user selected target   -> Connecting
-  remembered matched     -> Connecting
   scan timeout           -> Idle or Failed(no candidates / recoverable availability error)
   disconnect()           -> Idle
 
@@ -866,6 +1007,17 @@ Failed
 
 State machine owner - только `DefaultObdConnectionRepository`. Внутренние components возвращают события/results, но не мутируют `connectionState` напрямую.
 
+Текущее состояние skeleton-реализации state machine:
+
+- repository хранит `MutableStateFlow<ObdConnectionState>` с initial `Idle`;
+- repository сериализует операции через `Mutex` и хранит `activeScanJob` / `activeConnectJob`;
+- `scan()` выставляет `FindingAdapters`, транслирует `ObdDiscoveryEvent` в `ObdScanEvent` и держит accumulated candidates внутри repository;
+- `connect()` выставляет `Connecting`, затем через progress observer runner-а переводит state в `InitializingElm327`;
+- successful connect активирует `ObdSessionManager`, сохраняет `AdapterFingerprint`, отменяет active scan и выставляет `Connected`;
+- failed connect для известного candidate возвращает `FindingAdapters` и мутирует только этот candidate в `Rejected(error)`;
+- failed connect без известного candidate выставляет `Failed(error, recoverAction)`;
+- `disconnect()` отменяет active scan/connect jobs, закрывает active protocol session через `ObdSessionManager` и переводит state в `Idle`.
+
 ---
 
 ## Bluetooth Classic SPP
@@ -892,23 +1044,58 @@ Bluetooth Classic доступен только на Android.
 - проверяет Bluetooth permissions;
 - проверяет, включён ли Bluetooth;
 - читает bonded devices;
-- фильтрует вероятные OBD-адаптеры по имени и device class;
+- ранжирует вероятные OBD-адаптеры по имени;
 - возвращает candidates с confidence.
+
+MVP-реализация Classic scanner-а использует общий `ObdLikeNameMatcher`, а не отдельный список маркеров внутри scanner-а. Этот же matcher используется `ObdCandidateRanker`, чтобы scanner confidence и ranking не расходились со временем.
 
 Примеры имён для confidence:
 
 ```text
 OBDII
 OBD-II
+OBD2
 ELM327
 V-LINK
 Vgate
 OBDLink
 Viecar
 Car Scanner
+iCar
 ```
 
-Фильтр по имени не должен быть жёстким. Устройство с неизвестным именем можно показывать ниже в списке.
+Фильтр по имени не должен быть жёстким. Устройство с неизвестным именем можно показывать ниже в списке:
+
+- OBD-like имя -> `ObdAdapterConfidence.Medium`;
+- unknown/blank имя -> `ObdAdapterConfidence.Low`;
+- запись без валидного Bluetooth address не превращается в candidate;
+- `displayName = name ?: address`;
+- `target = ObdConnectionTarget.BluetoothClassic(deviceAddress = address, deviceName = name)`;
+- `capabilities = setOf(ObdAdapterCapability.BluetoothClassicSpp)`;
+- `probeState = AdvertisementOnly`.
+
+Device class можно добавить позже как дополнительный weak signal, но текущий MVP не должен отбрасывать bonded device только из-за неизвестного или неподходящего class: у дешёвых ELM327 clone-ов metadata часто нестабильна.
+
+Permission contract:
+
+- Android 12+ (`SDK >= 31`) требует runtime `BLUETOOTH_CONNECT` для доступа к `BluetoothAdapter.isEnabled`, `bondedDevices`, `BluetoothDevice.name` и `BluetoothDevice.address`;
+- Android 11 и ниже опираются на manifest-level legacy Bluetooth permissions из `composeApp`;
+- явный permission check делается через Android `Context`;
+- `SecurityException` на любом Bluetooth API маппится в `ObdError.PermissionDenied(GrantBluetoothPermission)`;
+- выключенный adapter маппится в `ObdError.BluetoothDisabled(EnableBluetooth)`;
+- пустой bonded list маппится в `ObdError.NoBondedClassicDevices(OpenAndroidBluetoothSettings)`.
+
+Scanner не вызывает `startDiscovery()`, `createBond()`, pairing UI, SPP socket или ELM327 probe. Он только отдаёт возможные candidates из уже спаренных устройств.
+
+Текущее состояние реализации:
+
+- `ObdLikeNameMatcher` добавлен в `shared/commonMain`;
+- `BluetoothClassicBondedDeviceMapper` добавлен в `shared/commonMain` как pure DTO -> domain mapper;
+- `AndroidBluetoothPermissionChecker` добавлен в `shared/androidMain`;
+- `AndroidBluetoothClassicScanner` добавлен в `shared/androidMain`;
+- scanner пока не подключён в `AndroidObdComponents`, потому что текущий `createPlatformObdComponents()` не принимает Android `Context`.
+
+Для runtime wiring нужен отдельный Android bootstrap/DI шаг: например `createAndroidPlatformObdComponents(context: Context)` или Koin module, который получает `applicationContext`. Глобальный context holder использовать не нужно.
 
 ### Connection
 
@@ -918,6 +1105,18 @@ Car Scanner
 - создаёт `incoming` stream из input stream;
 - пишет команды в output stream;
 - закрывает socket на cancel/disconnect.
+
+Текущее состояние реализации Classic transport:
+
+- `AndroidBluetoothClassicSppTransportFactory` добавлен в `shared/androidMain`;
+- transport поддерживает только `ObdConnectionTarget.BluetoothClassic`, для остальных target возвращает `UnsupportedTransport`;
+- factory получает `BluetoothAdapter`, проверяет enabled state, валидирует Bluetooth address и открывает RFCOMM socket через `createRfcommSocketToServiceRecord(SPP_UUID)`;
+- blocking `BluetoothSocket.connect()` выполняется на `Dispatchers.IO`, а timeout/cancellation закрывают socket, чтобы разблокировать platform connect;
+- `BluetoothClassicSppByteChannel` отдаёт hot `incoming` через buffered `Channel`, читает `InputStream` в read loop, пишет в `OutputStream` под write mutex и делает idempotent close;
+- transport маппит `SecurityException` в `PermissionDenied(GrantBluetoothPermission)`, disabled adapter в `BluetoothDisabled(EnableBluetooth)`, timeout в `Timeout(OpenTransport, BluetoothClassic, targetLabel)`, socket/read/write failures в `TransportClosed(BluetoothClassic, reason)`;
+- `AndroidObdComponents` уже подключает `AndroidBluetoothClassicSppTransportFactory` вместо Classic transport placeholder.
+
+Ограничение текущего wiring: полноценный UI flow через scan ещё не включает Android Classic scanner в `AndroidObdComponents`, потому что для scanner-а нужен согласованный `Context`/DI bootstrap. Transport-level connect к уже известному `ObdConnectionTarget.BluetoothClassic` доступен.
 
 ### iOS заглушка
 
@@ -974,8 +1173,7 @@ V-LINK
 - name match повышает `confidence`, но не должен быть единственным способом подключения;
 - remembered adapter можно пробовать даже при слабом name match, если stable id совпал;
 - устройства без имени или со странным именем не отбрасываются навсегда, а получают низкий score;
-- после короткого scan window неизвестные устройства можно проверить bounded service discovery, если не найден более уверенный кандидат;
-- чтобы не подключаться ко всему подряд, вводим лимиты: максимум unknown BLE candidates за scan и timeout на service discovery/probe.
+- в текущем skeleton scan не делает BLE service discovery/probe для unknown devices.
 
 Цель уровня 1 - не отсечь всё "непохожее", а сначала обработать наиболее вероятные устройства. Это защищает сценарий, где производитель назвал адаптер абсурдно или вообще не отдал local name.
 
@@ -989,7 +1187,7 @@ score 40: unknown name, но нормальный RSSI и connectable advertisem
 score 20: empty name, слабый RSSI или неполные advertisement данные
 ```
 
-Ranking сначала поднимает высокий score. Если за scan window нет хорошего кандидата, `ObdConnectionAttemptRunner` может проверить ограниченное число unknown candidates через service UUID / Generic UART fallback только для remembered adapter, ручного выбора пользователя или явно разрешённого debug/advanced сценария.
+Ranking сначала поднимает высокий score. В текущей продуктовой модели scan не открывает transport для проверки BLE fallback. BLE service discovery, profile selection и ELM327 handshake выполняются после explicit connect по выбранному candidate.
 
 ### Registry известных BLE-профилей
 
@@ -1003,13 +1201,15 @@ interface BleObdProfileRegistry {
      * device-specific профили (obdlink_cx) идут раньше generic (generic_fff0),
      * даже если их UUID совпадают.
      *
-     * Caller (ObdConnectionAttemptRunner) дополнительно фильтрует результат
-     * по deviceName/manufacturerData из BLE advertisement, чтобы при совпадении
-     * UUID выбрать более специфичный профиль.
+     * Caller (BLE transport/factory внутри ObdConnectionAttemptRunner flow)
+     * дополнительно фильтрует результат по deviceName/manufacturerData из
+     * BLE advertisement, чтобы при совпадении UUID выбрать более специфичный
+     * профиль.
      *
      * Например, если discovered services содержат FFF0, match() вернёт:
-     * [obdlink_cx, generic_fff0] — а runner выберет obdlink_cx при наличии
-     * имени "OBDLink CX" в advertisement, иначе generic_fff0.
+     * [obdlink_cx, generic_fff0] — а BLE transport/factory выберет
+     * obdlink_cx при наличии имени "OBDLink CX" в advertisement,
+     * иначе generic_fff0.
      */
     fun match(services: List<BleServiceSummary>): List<BleObdProfile>
 }
@@ -1062,12 +1262,12 @@ OBDLink CX совпадает с generic `FFF0/FFF1/FFF2`, но лучше де�
 4. vendor-specific profiles
 ```
 
-Правило disambiguation при совпадении UUID: `match()` возвращает все подходящие профили, отсортированные по специфичности. `ObdConnectionAttemptRunner` берёт первый профиль из списка и дополнительно сверяет `deviceName` / `manufacturerData` из BLE advertisement:
+Правило disambiguation при совпадении UUID: `match()` возвращает все подходящие профили, отсортированные по специфичности. BLE transport/factory внутри `ObdTransportFactory.open(target)` берёт первый профиль из списка и дополнительно сверяет `deviceName` / `manufacturerData` из BLE advertisement:
 
 - если `deviceName` содержит `"OBDLink CX"` (case-insensitive) → выбирается `obdlink_cx`, даже если `generic_fff0` тоже совпал по UUID;
 - если `deviceName` не совпадает ни с одним device-specific hint → выбирается первый generic профиль из отсортированного списка.
 
-Эта логика живёт в `ObdConnectionAttemptRunner`, а не внутри `BleObdProfileRegistry`. Registry отвечает только за возврат приоритетного списка кандидатов — окончательный выбор с учётом advertisement данных делает runner.
+Эта логика живёт в BLE transport/factory, а не внутри `BleObdProfileRegistry` и не в repository. Registry отвечает только за возврат приоритетного списка кандидатов — окончательный выбор с учётом advertisement данных делает BLE connection layer.
 
 Успешный service UUID match не переводит connection в `Connected`. `Connected` разрешён только после ELM327 probe и валидного ответа от адаптера.
 
@@ -1089,14 +1289,9 @@ OBDLink CX совпадает с generic `FFF0/FFF1/FFF2`, но лучше де�
    - валидировать, что ответ похож на ELM327: содержит `ELM327`, `v1.`, `v2.` или валидный prompt `>`.
 7. Первый валидный ответ превращает unknown BLE в рабочий `BleObdProfile`.
 
-Важно: fallback должен быть ограничен timeout и числом попыток, иначе auto-connect будет казаться зависшим.
+Важно: fallback должен быть ограничен timeout и числом попыток, иначе scan или подключение после выбора пользователя будет казаться зависшим.
 
-Fallback не должен запускаться для каждого BLE-устройства вокруг. Он запускается для:
-
-- remembered peripheral;
-- устройств с высоким name/manufacturer score;
-- ограниченного числа unknown candidates, если за scan window не найден уверенный OBD-кандидат;
-- устройства, выбранного пользователем вручную из expanded/advanced списка.
+Fallback не должен запускаться для каждого BLE-устройства вокруг. В текущей продуктовой модели он запускается только после explicit user selection.
 
 ### BLE MTU и chunking
 
@@ -1114,35 +1309,46 @@ ELM327 AT-команды обычно короткие, но ST-команды �
 ```mermaid
 sequenceDiagram
     participant Repo as Repository
-    participant Scanner as BLE Scanner
-    participant Gatt as BLE GATT
+    participant Discovery as ObdAdapterDiscovery
+    participant Runner as ConnectionAttemptRunner
+    participant Factory as ObdTransportFactory
+    participant Ble as BleObdPlatformClient
+    participant Conn as BlePeripheralConnection
     participant Registry as Profile Registry
     participant Channel as BLE Byte Channel
     participant Elm as ELM327 Protocol
 
-    Repo->>Scanner: scan BLE peripherals
-    Scanner-->>Repo: ranked candidates
-    Repo->>Gatt: connect peripheral
-    Gatt-->>Repo: discovered services
-    Repo->>Registry: build candidate profiles by service UUID
-    Registry-->>Repo: prioritized profiles or empty
-    loop each candidate profile
-        Repo->>Gatt: discover characteristics for profile service
-        Repo->>Channel: open candidate notify/write channel
-        Channel->>Gatt: subscribe notify
-        Repo->>Elm: probe with ATZ / ATI
-        Elm->>Channel: ATZ / ATI
-        Channel-->>Elm: bytes until ">" or timeout
-        alt ELM327-like response
-            Elm-->>Repo: Elm327Info
-        else rejected profile
-            Repo->>Channel: close and try next profile
-        end
+    Repo->>Discovery: scan BLE peripherals
+    Discovery->>Ble: scan(BleScanRequest)
+    Ble-->>Discovery: BleScanEvent.PeripheralFound
+    Discovery-->>Repo: DiscoveredObdAdapter(target = Ble)
+    Repo->>Runner: connect(target)
+    Runner->>Factory: open(target)
+    Factory->>Ble: resolver.resolve(target)
+    Ble-->>Factory: BleResolvedPeripheral
+    Factory->>Ble: connect(resolvedPeripheral)
+    Ble-->>Factory: BlePeripheralConnection
+    Factory->>Conn: discoverServices()
+    Conn-->>Factory: List<BleServiceSummary>
+    Factory->>Registry: build candidate profiles by service UUID
+    Registry-->>Factory: prioritized profiles or empty
+    Factory->>Conn: openSerialChannel(selected profile)
+    Conn-->>Factory: ObdByteChannel
+    Factory-->>Runner: ObdByteChannel
+    Runner->>Elm: probe with ATZ / ATI
+    Elm->>Channel: ATZ / ATI
+    Channel-->>Elm: bytes until ">" or timeout
+    alt ELM327-like response
+        Elm-->>Runner: Elm327Info
+    else rejected profile
+        Runner->>Channel: close
     end
     alt no known profile worked
-        Repo->>Gatt: scan all services for Generic UART pattern
+        Factory->>Conn: scan services for Generic UART pattern
     end
 ```
+
+В текущей форме `ObdTransportFactory.open(target)` возвращает один `ObdByteChannel`, а ELM327 validation живёт в `ObdConnectionAttemptRunner`. Поэтому ELM-driven retry по нескольким BLE profiles не должен быть спрятан в factory после возврата channel. Для полноценного fallback нужна отдельная будущая `BleConnectionStrategy` / extension runner-а, которая сможет последовательно открывать candidate channels, запускать ELM probe и закрывать rejected channels, но всё равно будет работать только через common `BleObdPlatformClient` / `BlePeripheralConnection`, без Android/iOS handles.
 
 ---
 
@@ -1210,6 +1416,13 @@ data class WifiNetworkSnapshot(
 3. known static endpoints;
 4. optional subnet scan только для маленького набора адресов, без агрессивного перебора всей сети.
 
+Текущее состояние реализации:
+
+- `WifiNetworkSnapshotProvider` и known endpoint candidate scanner уже добавлены в common код;
+- common `WifiTcpTransport` уже реализован через `ktor-network`: открывает один выбранный `host:port`, применяет connect timeout, отдаёт hot `ObdByteChannel.incoming` через buffered `Channel`, поддерживает `write()` / idempotent `close()` и маппит TCP failures в typed `ObdError`;
+- JVM integration tests используют локальный fake TCP server и проверяют byte exchange, remote close, write-after-close, idempotent close, unavailable endpoint, connect timeout и cancellation propagation;
+- parallel перебор нескольких Wi-Fi endpoints в `ObdConnectionAttemptRunner` пока не реализован и остаётся отдельной итерацией.
+
 ### Endpoint probing
 
 `WifiTcpCandidateScanner` только строит ordered list endpoint-ов. Открытие TCP socket и ELM327 probe выполняет `ObdConnectionAttemptRunner`, чтобы discovery не смешивался с connection lifecycle.
@@ -1263,7 +1476,7 @@ sequenceDiagram
 
     Repo->>Wifi: build candidates
     Wifi-->>Repo: host:port list
-    Repo->>Runner: connect selected/remembered Wi-Fi target
+    Repo->>Runner: connect selected Wi-Fi target
     Runner->>Tcp: connect endpoints in parallel
     Tcp-->>Runner: first opened socket
     Runner->>Elm: openSession(channel)
@@ -1363,7 +1576,7 @@ sealed interface Elm327ResponseStatus {
 
 ---
 
-## Auto-connect стратегия
+## Remembered-aware discovery стратегия
 
 ### Цель
 
@@ -1377,13 +1590,13 @@ sealed interface Elm327ResponseStatus {
 3. Classic scanner читает bonded devices, BLE scanner фильтрует advertisement по имени, Wi-Fi scanner проверяет known endpoints.
 4. Каждый scanner отдаёт candidates сразу по мере нахождения.
 5. UI показывает единый список без группировки по обязательному выбору типа.
-6. Для каждого candidate назначить confidence score.
+6. Repository помечает candidate как isRemembered, если он совпал с saved AdapterFingerprint.
 7. Сортировать candidates:
    remembered > exact known profile > strong name match > heuristic > low confidence.
 8. Если пользователь тапнул candidate - подключаться к нему.
-9. Без явного выбора пользователя автоматически подключаться можно только к remembered adapter.
-10. Если remembered adapter не найден или не прошёл ELM327 probe, оставить список кандидатов на экране и ждать выбор пользователя.
-11. Для Wi-Fi TCP разрешить ограниченный parallel connect/probe внутри `ObdConnectionAttemptRunner`.
+9. Если remembered adapter не найден, scan остаётся успешным: пользователь видит обычные candidates.
+10. Во время scan transport не открывается только из-за remembered match.
+11. Для Wi-Fi TCP разрешить ограниченный parallel connect/probe внутри `ObdConnectionAttemptRunner` только после explicit connect.
 12. После открытия транспорта всегда делать ELM327 handshake.
 13. Успешный endpoint/profile сохранить.
 14. Если примерно через 1 секунду на Android нет Classic bonded candidate и нет успешного подключения/явного выбора, показать вторичный Classic pairing hint.
@@ -1412,8 +1625,8 @@ BluetoothClassic  stableId = MAC-адрес устройства (e.g. "00:11:22
 
 BluetoothLowEnergy stableId = peripheralId из ObdConnectionTarget.Ble
                   На Android: MAC-адрес BLE устройства (stable для bonded,
-                  может быть randomized для non-bonded — в этом случае
-                  auto-connect по remembered требует свежего scan/resolve)
+                  может быть randomized для non-bonded — в этом случае remembered
+                  marking требует свежего scan/resolve)
                   На iOS: UUID из CBPeripheral.identifier —
                   стабилен для конкретного приложения на конкретном устройстве,
                   но отличается от UUID того же peripheral на другом iPhone
@@ -1431,13 +1644,13 @@ WifiTcp           stableId = "host:port" (e.g. "192.168.0.10:35000")
 
 ## Koin DI
 
+Текущее состояние: OBD Koin module ещё не добавлен в код. Если добавить binding для текущего skeleton прямо сейчас, он должен соответствовать фактическому constructor-у `DefaultObdConnectionRepository`.
+
 ### Common module
 
 ```kotlin
 val obdCommonModule = module {
-    single { ObdScanCoordinator(discovery = get()) }
     single { ObdCandidateRanker() }
-    single { ObdCandidateValidator(transportFactory = get(), elm327Protocol = get()) }
     single {
         ObdConnectionAttemptRunner(
             transportFactory = get(),
@@ -1447,22 +1660,16 @@ val obdCommonModule = module {
     }
     single { ObdSessionManager() }
     single { AdapterMemory(settings = get()) }
-    single { ObdErrorMapper() }
-
-    // Logger опциональный: биндится как no-op по умолчанию.
-    // В debug build platform module может переопределить это на реальный logger.
-    single<ObdConnectionLogger> { NoOpObdConnectionLogger() }
 
     single<ObdConnectionRepository> {
         DefaultObdConnectionRepository(
-            scanCoordinator = get(),
+            scope = get(),
+            discovery = get(),
             candidateRanker = get(),
-            candidateValidator = get(),
             attemptRunner = get(),
             sessionManager = get(),
             adapterMemory = get(),
-            errorMapper = get(),
-            logger = get()
+            now = { Clock.System.now() }
         )
     }
 
@@ -1476,10 +1683,21 @@ val obdCommonModule = module {
     factory { ObserveObdConnectionStateUseCase(get()) }
     factory { ScanObdAdaptersUseCase(get()) }
     factory { ConnectObdAdapterUseCase(get()) }
-    factory { AutoConnectObdAdapterUseCase(get()) }
     factory { DisconnectObdAdapterUseCase(get()) }
 }
 ```
+
+Пока `DefaultObdConnectionRepository` использует `ObdAdapterDiscovery` напрямую, а не `ObdScanCoordinator`, и не принимает `ObdErrorMapper` или `ObdConnectionLogger`.
+
+Future additions для полного target design:
+
+```kotlin
+single { ObdScanCoordinator(discovery = get()) }
+single { ObdErrorMapper() }
+single<ObdConnectionLogger> { NoOpObdConnectionLogger() }
+```
+
+Когда эти компоненты будут подключены, constructor `DefaultObdConnectionRepository` и DI binding нужно синхронно расширить.
 
 ### Android module
 
@@ -1488,7 +1706,7 @@ val obdAndroidModule = module {
     single<BluetoothClassicScanner> { AndroidBluetoothClassicScanner(get()) }
     single<BluetoothClassicTransportFactory> { AndroidBluetoothClassicSppTransportFactory(get()) }
     single<BleObdPlatformClient> { AndroidBleObdPlatformClient(get()) }
-    single<BlePeripheralResolver> { AndroidBlePeripheralResolver(get()) }
+    single<BlePeripheralResolver> { get<BleObdPlatformClient>().resolver }
     single<WifiNetworkSnapshotProvider> { AndroidWifiNetworkSnapshotProvider(get()) }
 
     // ObdTransportFactory агрегирует платформенные транспорты.
@@ -1513,7 +1731,7 @@ val obdIosModule = module {
     single<BluetoothClassicScanner> { UnsupportedBluetoothClassicScanner() }
     single<BluetoothClassicTransportFactory> { UnsupportedBluetoothClassicTransportFactory() }
     single<BleObdPlatformClient> { IosBleObdPlatformClient() }
-    single<BlePeripheralResolver> { IosBlePeripheralResolver(get()) }
+    single<BlePeripheralResolver> { get<BleObdPlatformClient>().resolver }
     single<WifiNetworkSnapshotProvider> { IosWifiNetworkSnapshotProvider() }
 
     single<ObdTransportFactory> {
@@ -1539,7 +1757,7 @@ UI
  -> user taps "Найти адаптер"
  -> ScanObdAdaptersUseCase
  -> ObdConnectionRepository.scan()
- -> ObdScanCoordinator
+ -> ObdScanCoordinator (target design) / DefaultObdConnectionRepository direct aggregation (current skeleton)
  -> ObdAdapterDiscovery
  -> Classic + BLE + Wi-Fi scanners run in parallel
  -> ObdDiscoveryEvent candidates/errors emit immediately
@@ -1601,16 +1819,16 @@ UI не должен говорить пользователю "это точн�
 Проверьте, что телефон подключён к Wi-Fi сети OBD-адаптера.
 ```
 
-### Auto-connect
+### Remembered-aware scan
 
 ```text
-UI taps "Найти адаптер" / auto-connect starts
- -> AutoConnectObdAdapterUseCase
+UI taps "Найти адаптер"
+ -> ScanObdAdaptersUseCase
  -> repository loads remembered adapter
  -> repository runs parallel scan across Classic/BLE/Wi-Fi
- -> repository ranks candidates
- -> repository may auto-connect only to remembered adapter
- -> if remembered adapter fails or is absent: UI waits for user tap
+ -> repository marks matching candidates isRemembered = true
+ -> repository ranks candidates, remembered first
+ -> UI shows remembered marker and waits for user tap
  -> selected candidate passes ELM handshake
  -> fingerprint saved after success
 ```
@@ -1648,7 +1866,6 @@ interface ObdConnectionRepository {
     fun observeSupportedTransports(): Flow<List<ObdTransportAvailability>>
     fun scan(request: ObdScanRequest): Flow<ObdScanEvent>
     suspend fun connect(target: ObdConnectionTarget): ObdResult<ObdSession>
-    suspend fun autoConnect(policy: ObdAutoConnectPolicy): ObdResult<ObdSession>
     suspend fun disconnect()
 }
 ```
@@ -1656,7 +1873,7 @@ interface ObdConnectionRepository {
 Правила:
 - `commandGateway` доступен всегда (не nullable, не suspend), но при вызове `send()` без active `ObdSession` сразу возвращает `ObdResult.Failure(ObdError.TransportClosed(...))`;
 - Diagnostics/PID feature зависит только от `ObdCommandGateway` и `ObdConnectionRepository.connectionState` — не от `Elm327ProtocolSession`, `ObdByteChannel` или любого транспортного типа;
-- `ObdCommandGateway` биндится в DI через `DefaultObdConnectionRepository.commandGateway`, как показано в Koin module выше.
+- после добавления DI `ObdCommandGateway` должен биндиться через `DefaultObdConnectionRepository.commandGateway`, как показано в Koin skeleton выше.
 
 `ObdCommandGateway` использует текущий `Elm327ProtocolSession` из `ObdSessionManager`, сохраняет последовательность команд через тот же Mutex что и handshake, и возвращает typed errors при закрытом transport-е.
 
@@ -1706,22 +1923,15 @@ Failed with retry/user action
 - confidence score и rejected/probe states;
 - отсутствие UI-выбора транспорта при сохранении внутренней стратегии.
 
-### CandidateValidator отвечает за
-
-- optional bounded ELM327 probe для candidates без создания долгой session;
-- использование тех же transport/protocol components, что и connect path;
-- строгие лимиты timeout/parallelism, особенно для BLE unknown и Wi-Fi endpoints;
-- закрытие channel после каждого probe;
-- возврат `CandidateUpdated` с `ProbeConfirmed` или `Rejected`.
-
 ### ConnectionAttemptRunner отвечает за
 
 - открытие transport через `ObdTransportFactory`;
 - ELM327 handshake через `Elm327Protocol.openSession`;
+- отправку typed progress step-ов caller-у через optional `ObdConnectionAttemptObserver`;
 - возврат `ObdConnectionAttemptResult(session, protocolSession)` после успешного handshake;
 - передачу ownership успешной `Elm327ProtocolSession` caller-у без закрытия;
 - parallel Wi-Fi endpoint attempts с закрытием проигравших sockets;
-- BLE profile probing/fallback для выбранного или remembered candidate;
+- BLE profile probing/fallback для выбранного candidate;
 - закрытие открытого `ObdByteChannel` при failed handshake до возврата ошибки;
 - закрытие открытого `ObdByteChannel` при cancellation после открытия transport-а.
 
@@ -1735,6 +1945,16 @@ ObdTransportFactory.open(target)
 ```
 
 Если `open(target)` вернул failure, runner возвращает эту ошибку и не вызывает protocol. Если `openSession(channel)` вернул failure, runner закрывает channel и возвращает исходную typed error. `CancellationException` не маппится в `ObdResult.Failure`: cancellation пробрасывается выше, но уже открытый channel должен быть закрыт в `finally`.
+
+Текущий skeleton runner-а поддерживает observer:
+
+```kotlin
+fun interface ObdConnectionAttemptObserver {
+    suspend fun onStep(step: ObdConnectionStep)
+}
+```
+
+Сейчас runner отправляет `OpeningTransport` перед `ObdTransportFactory.open(target)` и `SendingElmHandshake` после успешного открытия channel перед `Elm327Protocol.openSession(channel)`. Repository маппит `SendingElmHandshake` в `ObdConnectionState.InitializingElm327`.
 
 `ConnectedObdAdapter` строится из `ObdConnectionTarget` без platform handles:
 
@@ -1813,7 +2033,7 @@ Logger не должен быть обязательным для бизнес-�
 - Не отправлять несколько ELM327-команд параллельно в один transport.
 - Не делать BLE unknown fallback бесконечным: только bounded attempts.
 - Не показывать iOS Classic как доступный транспорт.
-- Не делать silent auto-connect к новому candidate, который ещё не был remembered и ELM-confirmed ранее.
+- Не открывать transport автоматически во время scan только из-за remembered/ranking match.
 - Не смешивать discovery и connection probing внутри scanner-ов.
 - Не логировать raw vehicle data в удалённую аналитику по умолчанию.
 
@@ -1826,9 +2046,13 @@ Logger не должен быть обязательным для бизнес-�
 - `Elm327ProtocolSession` parser tests: prompt `>`, echo on/off, whitespace, multi-frame text, `NO DATA`, `?`, `UNABLE TO CONNECT`, timeout.
 - `FakeObdByteChannel` tests: close idempotency, typed `Closed(error)`, `write()` after close.
 - Repository state machine tests: scan, user connect, failed candidate returns to list, successful connect cancels scan, disconnect cancels children.
-- Candidate ranking tests: remembered adapter priority, strong name match, rejected candidate demotion, no silent auto-connect to unknown candidate.
+- Repository remembered-aware scan tests: remembered candidate marked, remembered candidate ranked first, scan does not open transport, absent remembered match is not a scan failure.
+- Candidate ranking tests: remembered adapter priority, strong name match, rejected candidate demotion.
+- OBD-like name matcher tests: case-insensitive matching, separator normalization, known Classic/OBD vendor markers, unknown/blank/null names.
+- Bluetooth Classic bonded device mapper tests: address/name mapping, confidence by name, blank name fallback, invalid address rejection.
 - BLE profile registry tests: `FFF0/FFF1/FFF2`, `18F0`, duplicate matches, OBDLink CX specificity.
 - Wi-Fi endpoint ordering tests: remembered endpoint, gateway endpoints, static endpoints, parallel attempt winner closes losers.
+- Wi-Fi TCP transport JVM integration tests: local fake TCP server, byte exchange, connect timeout, hot incoming stream, remote close, write-after-close, idempotent close, cancellation propagation.
 - Cancellation tests: cancellation closes channel/GATT/socket and does not emit stale `Connected`.
 - Error mapping tests: platform exceptions are converted to `ObdError` before crossing data/domain boundary.
 
@@ -1851,10 +2075,18 @@ Wi-Fi ELM327 adapter с 35000/23 endpoint
 - `ObdConnectionRepository` interface.
 - Use cases.
 - `ObdResult`.
-- `ObdScanCoordinator`, `ObdCandidateRanker`, `ObdCandidateValidator`, `ObdConnectionAttemptRunner`, `ObdSessionManager`.
+- `ObdScanCoordinator`, `ObdCandidateRanker`, `ObdConnectionAttemptRunner`, `ObdSessionManager`.
 - `FakeObdByteChannel`, fake transport и unit-тесты ELM327 handshake/state machine.
 - Empty platform bindings.
 - iOS Classic unsupported stub.
+
+Текущее состояние итерации 1:
+
+- domain models, repository interface, use cases, `ObdResult`, `ObdCandidateRanker`, `ObdConnectionAttemptRunner`, `ObdSessionManager` и `AdapterMemory` уже добавлены;
+- `DefaultObdConnectionRepository` уже реализует skeleton state machine с fake discovery/transport tests;
+- `ObdConnectionAttemptRunner` уже умеет отдавать progress step-ы через `ObdConnectionAttemptObserver`;
+- `DefaultObdConnectionRepository.scan()` уже помечает remembered candidates через `isRemembered` и не открывает transport без explicit `connect`;
+- `ObdScanCoordinator`, OBD Koin module, empty platform bindings и iOS Classic unsupported stub ещё не добавлены.
 
 ### Итерация 2: Wi-Fi TCP
 
@@ -1862,7 +2094,15 @@ Wi-Fi ELM327 adapter с 35000/23 endpoint
 - Known endpoint candidate scanner.
 - Ktor TCP transport.
 - ELM327 handshake.
-- Auto-connect по remembered Wi-Fi fingerprint.
+- remembered-aware ranking по Wi-Fi fingerprint.
+
+Текущее состояние итерации 2:
+
+- `WifiNetworkSnapshotProvider`, known endpoint candidate scanner и remembered-aware Wi-Fi ranking уже есть;
+- common `WifiTcpTransport` через `ktor-network` уже есть и покрыт JVM integration tests с локальным fake TCP server;
+- ELM327 handshake уже выполняется общим `ObdConnectionAttemptRunner` после открытия TCP transport-а;
+- Android manifest baseline для `INTERNET`, network state и Wi-Fi state уже добавлен в `composeApp`;
+- parallel endpoint attempts, DI binding и platform Wi-Fi snapshot implementations ещё не добавлены.
 
 Wi-Fi хорош для ранней реализации, потому что общий для Android/iOS и не требует BLE permissions.
 
@@ -1870,8 +2110,30 @@ Wi-Fi хорош для ранней реализации, потому что �
 
 - Bonded devices scanner.
 - SPP transport.
-- Android permissions.
-- Manual select + auto-connect remembered adapter.
+- Android runtime permission checks для Classic/BLE path.
+- Manual select + remembered adapter highlighting.
+
+Текущее состояние Classic scanner:
+
+- `ObdLikeNameMatcher` уже добавлен и используется для Classic name confidence и ranking;
+- `BluetoothClassicBondedDeviceMapper` уже добавлен и покрыт common unit tests;
+- `AndroidBluetoothPermissionChecker` уже добавлен для `BLUETOOTH_CONNECT` на Android 12+;
+- `AndroidBluetoothClassicScanner` уже добавлен: проверяет availability/permission/enabled state, читает `bondedDevices`, маппит typed errors и отдаёт `CandidateFound`;
+- `AndroidBluetoothClassicSppTransportFactory` уже добавлен и подключён в `AndroidObdComponents`;
+- scanner проверяется через `:shared:compileDebugKotlinAndroid`, mapper/name logic — через `:shared:jvmTest`;
+- runtime wiring в `AndroidObdComponents` ещё не сделан, потому что нужен согласованный способ передать Android `Context` в platform components.
+
+Что ещё не сделано в Classic path:
+
+- runtime permission request UI;
+- platform availability mapping на основе реального Bluetooth state/permission;
+- Android DI/bootstrap для `Context`;
+- manual QA на реальном Bluetooth Classic ELM327 clone.
+
+Текущее состояние Android permissions:
+
+- manifest baseline для legacy Bluetooth, Android 12+ Bluetooth scan/connect и Android 6-11 BLE scan location уже добавлен в `composeApp`;
+- runtime permission UI и platform availability mapping остаются отдельной итерацией.
 
 ### Итерация 4: BLE known profiles
 
@@ -1881,6 +2143,15 @@ Wi-Fi хорош для ранней реализации, потому что �
 - FFF0/FFF1/FFF2 support.
 - OBDLink CX profile id.
 - MTU/chunking.
+
+Текущее состояние BLE common contracts:
+
+- common `BleObdPlatformClient` добавлен как lifecycle owner для platform BLE state;
+- common `BlePeripheralResolver` добавлен и должен получаться из того же `BleObdPlatformClient`, а не создаваться независимым singleton;
+- common scan contracts добавлены: `BleScanRequest`, `BleScanEvent`, `BleScannedPeripheral`, `BleManufacturerData`;
+- common connection contracts добавлены: `BleResolvedPeripheral`, `BlePeripheralConnection`, `discoverServices()`, `openSerialChannel(profile)`, idempotent `close()`;
+- Android/iOS BLE scanner, GATT client, MTU/chunking, profile probing/fallback и wiring в platform components ещё не реализованы;
+- BLE discovery пока не подключается в `CompositeObdAdapterDiscovery`: перед этим нужен parallel scan aggregation, потому что текущий composite выполняет discovery sequentially.
 
 ### Итерация 5: BLE unknown fallback
 
@@ -1897,7 +2168,7 @@ Wi-Fi хорош для ранней реализации, потому что �
 2. Нужен ли advanced screen для ручного host:port и BLE UUID. Для первой версии лучше не показывать, но оставить внутреннюю модель готовой.
 3. Какой timeout считать нормальным для дешёвых ELM327 clones. Рекомендуемый старт: TCP connect 1s, BLE probe 3-5s, `ATZ` 5s, обычная AT-команда 1.5-2s.
 4. Где хранить локальные diagnostic logs и как пользователь сможет ими поделиться. Raw ELM exchanges полезны локально, но удалённая аналитика должна быть opt-in и redacted.
-5. Нужен ли pre-validation candidates во время scan. Для MVP можно оставить validation только на remembered/manual connect, а `ObdCandidateValidator` включать позже без изменения публичного API.
+5. Scan-time pre-validation не используется в MVP: validation запускается только после явного выбора пользователя через `connect(target)`.
 
 ---
 
@@ -1910,13 +2181,10 @@ flowchart LR
     C --> D["ObdConnectionRepository"]
     D --> SC["ScanCoordinator"]
     D --> R["CandidateRanker"]
-    D --> V["CandidateValidator"]
     D --> AR["ConnectionAttemptRunner"]
     D --> SM["SessionManager"]
     D --> LOG["ObdConnectionLogger"]
     SC --> E["Discovery"]
-    V --> F["TransportFactory"]
-    V --> G["Elm327Protocol"]
     AR --> F["TransportFactory"]
     AR --> G["Elm327Protocol"]
     SM --> O["Unified ELM327 Session"]

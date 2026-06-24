@@ -15,6 +15,12 @@ interface ObdByteChannel {
 
     suspend fun write(bytes: ByteArray): ObdResult<Unit>
 
+    /**
+     * Closes the opened transport resources.
+     *
+     * Implementations must make this operation idempotent because cancellation,
+     * protocol failure, and validation cleanup can race at ownership boundaries.
+     */
     suspend fun close()
 }
 
